@@ -1,0 +1,4 @@
+F1_data_cache/
+*.csv
+__pycache__/
+.venv/
