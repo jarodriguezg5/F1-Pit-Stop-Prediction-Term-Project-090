@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 
 # Pick up where the target-building left off
-df = pd.read_csv('f1_2024_with_target.csv')
+df = pd.read_csv('f1_all_with_target.csv', low_memory=False)
 
 # LapTime comes as text like "0 days 00:01:37.284000". Can't do math on text,
 # so turn it into plain seconds (97.284).
@@ -28,7 +28,8 @@ df['RedFlagThisLap']   = df['TrackStatus'].str.contains('5').astype(int)
 df['AnyCautionThisLap'] = ((df['SafetyCarThisLap'] == 1) | (df['VSCThisLap'] == 1)).astype(int)
 
 # Was there a caution on the PREVIOUS lap? shift(1) looks BACKWARD into the past,
-# which is always safe — that's information we genuinely had at the time.
+# which is always safe - that's information we genuinely had at the time. Grouping
+# by Year too, same reason as build_target.py: round numbers repeat across seasons.
 driver_race_groups = df.groupby(['Year', 'RoundNumber', 'Driver'])
 df['CautionPrevLap'] = driver_race_groups['AnyCautionThisLap'].shift(1).fillna(0).astype(int)
 
@@ -44,8 +45,8 @@ df['CautionJustStarted'] = ((df['AnyCautionThisLap'] == 1) & (df['CautionPrevLap
 #   in-lap  -> driver crawls into the pit lane
 #   out-lap -> driver crawls back out
 #   caution -> safety car / VSC / yellow forces the whole field to slow
-# Under a safety car laps run ~157s instead of ~90s. Letting those through makes
-# the feature read a 67-second "degradation" that has nothing to do with rubber.
+# Under a safety car laps run far slower than normal. Letting those through makes
+# the feature read a huge "degradation" that has nothing to do with rubber.
 df['IsInLap']  = df['PitInTime'].notna()
 df['IsOutLap'] = df['PitOutTime'].notna()
 
@@ -58,8 +59,8 @@ df['DistortedLap'] = (df['IsInLap'] | df['IsOutLap'] |
 df['CleanLapTime'] = df['LapTimeSeconds']
 df.loc[df['DistortedLap'], 'CleanLapTime'] = np.nan
 
-# Group by Stint too, because tires RESET at every pit stop. Degradation on a
-# fresh set should start from scratch, not inherit the worn-out set's numbers.
+# Group by Year, Stint too, because tires RESET at every pit stop, and round
+# numbers repeat across seasons.
 df = df.sort_values(['Year', 'RoundNumber', 'Driver', 'Stint', 'LapNumber']).reset_index(drop=True)
 stint_groups = df.groupby(['Year', 'RoundNumber', 'Driver', 'Stint'])
 
@@ -71,9 +72,7 @@ df['StintBestSoFar'] = stint_groups['CleanLapTime'].transform(lambda s: s.expand
 df['TireDegDelta'] = df['CleanLapTime'] - df['StintBestSoFar']
 
 # On a distorted lap the delta is undefined, so carry forward the last honest
-# reading instead. That matches reality - the pit wall doesn't forget how worn
-# the tires were just because a safety car came out. ffill only reaches backward
-# in time, so it stays leak-free.
+# reading instead. ffill only reaches backward in time, so it stays leak-free.
 df['TireDegDelta'] = df.groupby(
     ['Year', 'RoundNumber', 'Driver', 'Stint'])['TireDegDelta'].ffill()
 
@@ -82,8 +81,10 @@ df['TireDegDelta'] = df['TireDegDelta'].fillna(0)
 
 # FEATURE 3: Wet conditions (free weather proxy)
 
-# If a driver is on INTERMEDIATE or WET tires, it's raining. We don't need the
-# full weather telemetry to know that — the tire choice already tells us.
+# If a driver is on INTERMEDIATE or WET tires, it's raining. These two compound
+# names are the only ones that survived unchanged across every season - the dry
+# compound names (HYPERSOFT, ULTRASOFT, SUPERSOFT in 2018-19; SOFT/MEDIUM/HARD
+# from 2019 on) changed, but wet-weather tires never did.
 df['WetConditions'] = df['Compound'].isin(['INTERMEDIATE', 'WET']).astype(int)
 
 # FEATURE 4: Race progress and laps remaining
@@ -91,18 +92,14 @@ df['WetConditions'] = df['Compound'].isin(['INTERMEDIATE', 'WET']).astype(int)
 # How long is this race? Take the highest lap number anyone reached, which is the
 # winner's count. The +1 is a correction: build_target.py dropped every driver's
 # final lap, so what we can still see is one lap short of the real distance.
-# With the +1 these match the official 2024 distances (Bahrain 57, Monaco 78).
 #
-# Important: this is computed per RACE, not per driver. If we used each driver's
-# own highest lap, a car that retired on lap 20 would look like it ran a 20-lap
-# race — and "how close am I to the end" would secretly encode "I'm about to
-# break down." That's the future leaking in through the back door.
+# Computed per YEAR + RACE, never per driver, and now that matters even more:
+# with 7 seasons of retirements mixed in, using a driver's own max lap would
+# encode their retirement as "100% through the race" for a huge chunk of the data.
 df['RaceTotalLaps'] = df.groupby(['Year', 'RoundNumber'])['LapNumber'].transform('max') + 1
 
-# Same idea expressed two ways. Progress is a 0-to-1 fraction, so it's comparable
-# across circuits (lap 30 means something very different at Monaco vs Spa).
-# LapsRemaining is the absolute count, which is what actually decides whether a
-# stop can pay for itself — you need enough laps left to recover the ~22s you lose.
+# Progress is a 0-to-1 fraction, comparable across circuits AND across years -
+# useful now that race distances vary not just by track but by season's calendar.
 df['RaceProgress']  = df['LapNumber'] / df['RaceTotalLaps']
 df['LapsRemaining'] = df['RaceTotalLaps'] - df['LapNumber']
 
@@ -110,15 +107,13 @@ df['LapsRemaining'] = df['RaceTotalLaps'] - df['LapNumber']
 
 df = df.sort_values(['Year', 'RoundNumber', 'Driver', 'LapNumber']).reset_index(drop=True)
 
-# cumsum() adds up the pit flags as we walk down each driver's race: 0,0,0,1,1,1,2...
-# It only sums rows above the current one, so it's naturally backward-looking.
-# Including the current lap is fine — if a driver pitted on lap L, that already
-# happened by the time we're deciding about lap L+1.
+# cumsum() adds up the pit flags as we walk down each driver's race. Grouping by
+# Year keeps this from carrying a stop count over between different seasons.
 df['StopsSoFar'] = df.groupby(['Year', 'RoundNumber', 'Driver'])['PittedThisLap'].cumsum()
 
 # Sanity checks
 
-print("Tire degradation (green and caution should now be similar magnitude):")
+print("Tire degradation (green and caution should be similar magnitude):")
 print("  green flag laps:  {:.3f}s".format(df[df.AnyCautionThisLap == 0]['TireDegDelta'].mean()))
 print("  caution laps:     {:.3f}s".format(df[df.AnyCautionThisLap == 1]['TireDegDelta'].mean()))
 
@@ -156,5 +151,5 @@ for k in sorted(df['StopsSoFar'].unique()):
     subset = df[df.StopsSoFar == k]
     print("  {} stops   n={:6d}   {:5.2f}%".format(int(k), len(subset), 100 * subset['PitNextLap'].mean()))
 
-df.to_csv('f1_2024_features.csv', index=False)
-print("\nSaved to f1_2024_features.csv")
+df.to_csv('f1_all_features.csv', index=False)
+print("\nSaved to f1_all_features.csv")
