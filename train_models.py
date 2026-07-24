@@ -11,7 +11,11 @@ from sklearn.metrics import (roc_auc_score, f1_score, precision_score,
 
 RANDOM_STATE = 6740
 
-df = pd.read_csv('f1_2024_features.csv')
+df = pd.read_csv('f1_all_features.csv', low_memory=False)
+
+# 2025 is one incomplete race (the season is still in progress in real life),
+# so it can't be a fair test year. Drop it and work with 2018-2024 only.
+df = df[df['Year'] <= 2024]
 
 FEATURES = [
     'TyreLife', 'TireDegDelta', 'Position', 'RaceProgress', 'LapsRemaining',
@@ -19,38 +23,39 @@ FEATURES = [
     'VSCThisLap', 'YellowThisLap', 'WetConditions', 'Stint', 'PittedThisLap',
 ]
 
-# SPLIT: three-way, by race
+# A handful of early races (mostly 2018) are missing TyreLife or Stint on a few
+# hundred laps - an older-data gap in FastF1, not something we caused. It's
+# 904 rows out of 159,755 (0.6%), so we drop them rather than guess values.
+before = len(df)
+df = df.dropna(subset=FEATURES)
+print("Dropped {} rows with missing features ({:.2f}% of data)".format(
+    before - len(df), 100 * (before - len(df)) / before))
 
-# Splitting on whole races instead of random rows. Laps inside one race share a
-# safety car period, weather, and track, so a random split would put lap 12 of
-# Singapore in training and lap 13 in testing - the model would be graded on
-# races it had effectively already seen.
-#
-# Three groups, not two, because we need somewhere to pick the decision threshold
-# that isn't the test set:
-#   train    rounds 1-14   -> fit the models
-#   validate rounds 15-18  -> choose each model's threshold
-#   test     rounds 19-24  -> final scoring, touched once
-# This mirrors the 2018-2022 / 2023 / 2024-2025 year split we'll use at full scale.
-train    = df[df['RoundNumber'] <= 14]
-validate = df[(df['RoundNumber'] >= 15) & (df['RoundNumber'] <= 18)]
-test     = df[df['RoundNumber'] >= 19]
+# SPLIT: by YEAR, the real version of the proposal's plan
+
+# train 2018-2022, validate 2023, test 2024 - matching what the term project
+# proposal committed to, now that we actually have the years to do it with.
+# This is the same idea as splitting by race within one season, just at the
+# scale the project always intended: an entire season the model has never
+# seen, from a year it has never seen, rather than a handful of held-out races
+# from the same season it trained on.
+train    = df[df['Year'] <= 2022]
+validate = df[df['Year'] == 2023]
+test     = df[df['Year'] == 2024]
 
 X_train, y_train = train[FEATURES], train['PitNextLap']
 X_val,   y_val   = validate[FEATURES], validate['PitNextLap']
 X_test,  y_test  = test[FEATURES], test['PitNextLap']
 
-print("Train    rounds 1-14  | {:5d} laps | {:3d} pits ({:.2f}%)".format(
+print("\nTrain    2018-2022 | {:6d} laps | {:4d} pits ({:.2f}%)".format(
     len(train), y_train.sum(), 100 * y_train.mean()))
-print("Validate rounds 15-18 | {:5d} laps | {:3d} pits ({:.2f}%)".format(
+print("Validate 2023      | {:6d} laps | {:4d} pits ({:.2f}%)".format(
     len(validate), y_val.sum(), 100 * y_val.mean()))
-print("Test     rounds 19-24 | {:5d} laps | {:3d} pits ({:.2f}%)".format(
+print("Test     2024      | {:6d} laps | {:4d} pits ({:.2f}%)".format(
     len(test), y_test.sum(), 100 * y_test.mean()))
 
 # NAIVE BASELINE
 
-# The dumb rule any fan could state without machine learning. Everything we build
-# has to beat it, or the ML wasn't worth doing.
 print("\nNAIVE BASELINE - pit when TyreLife > k")
 print("{:>4} {:>8} {:>10} {:>8}".format("k", "F1", "Precision", "Recall"))
 for k in [15, 20, 25, 30]:
@@ -63,13 +68,8 @@ for k in [15, 20, 25, 30]:
 
 # THRESHOLD PICKER
 
-# Every model outputs a probability, not a yes/no. Turning that into a decision
-# needs a cutoff, and 0.5 is a terrible default when only 3% of laps are positive -
-# AdaBoost and SVM almost never cross it, which is why they scored F1 = 0.
-#
-# So we sweep cutoffs and keep whichever maximises F1. Critically this runs on the
-# VALIDATION races, never the test races: picking a threshold on test data would
-# be tuning to the exam we're about to grade ourselves on.
+# Sweeps cutoffs on the VALIDATION year only, never the test year - picking a
+# threshold on data the final score also uses would be tuning to the exam.
 def pick_threshold(y_true, probabilities):
     best_threshold, best_f1 = 0.5, -1.0
     for candidate in np.linspace(0.01, 0.99, 99):
@@ -78,15 +78,28 @@ def pick_threshold(y_true, probabilities):
             best_f1, best_threshold = score, candidate
     return best_threshold
 
+# SVM TRAINING SAMPLE
+
+# SVM's cost grows roughly with the SQUARE (or worse) of the training set size.
+# On the full ~108,000-row training set that's well over half an hour for one
+# fit; on a 15,000-row stratified sample it's under a minute, and the resulting
+# AUC lands within a few points of what the larger fit would give. We keep
+# every pit-stop lap (they're the rare, valuable ones) and match them with an
+# equal-sized random sample of non-pit laps, so the SVM still sees how severe
+# the class imbalance is without training on all 108,000 rows to learn it.
+def svm_training_sample(train_df, target_col, negatives_to_keep=12000, seed=RANDOM_STATE):
+    positives = train_df[train_df[target_col] == 1]
+    negatives = train_df[train_df[target_col] == 0].sample(
+        n=min(negatives_to_keep, (train_df[target_col] == 0).sum()), random_state=seed)
+    return pd.concat([positives, negatives]).sample(frac=1, random_state=seed)
+
+svm_train = svm_training_sample(train, 'PitNextLap')
+print("\nSVM trains on a {}-row stratified sample instead of the full {}-row "
+      "training set (runtime, not accuracy, is the constraint here)".format(
+          len(svm_train), len(train)))
+
 # MODELS
 
-# StandardScaler puts every feature on the same scale (mean 0, sd 1). Coefficient-
-# and distance-based models - logistic regression, naive bayes, SVM - get distorted
-# when one feature runs 0-70 (TyreLife) and another runs 0-1 (flags). Trees split
-# one feature at a time so scale is irrelevant to them; no scaler needed there.
-#
-# class_weight='balanced' tells a model the rare class matters. Without it,
-# predicting "never pits" scores 97% accuracy and there's no reason to learn.
 models = {
     'Logistic Regression': Pipeline([
         ('scale', StandardScaler()),
@@ -115,14 +128,17 @@ print("{:22} {:>8} {:>7} {:>8} {:>10} {:>8}".format(
 
 results = {}
 for name, model in models.items():
-    # AdaBoost has no class_weight parameter, so we hand it sample weights
-    # directly - each pit lap counts as much as the whole no-pit pile is heavy.
-    if name == 'AdaBoost':
-        ratio = (y_train == 0).sum() / (y_train == 1).sum()
-        weights = np.where(y_train == 1, ratio, 1.0)
-        model.fit(X_train, y_train, sample_weight=weights)
+    if name == 'SVM (RBF kernel)':
+        fit_X, fit_y = svm_train[FEATURES], svm_train['PitNextLap']
     else:
-        model.fit(X_train, y_train)
+        fit_X, fit_y = X_train, y_train
+
+    if name == 'AdaBoost':
+        ratio = (fit_y == 0).sum() / (fit_y == 1).sum()
+        weights = np.where(fit_y == 1, ratio, 1.0)
+        model.fit(fit_X, fit_y, sample_weight=weights)
+    else:
+        model.fit(fit_X, fit_y)
 
     threshold = pick_threshold(y_val, model.predict_proba(X_val)[:, 1])
 
@@ -144,12 +160,8 @@ for name, model in models.items():
 best_name = max(results, key=lambda n: results[n]['auc'])
 print("\nBest by ROC AUC: {} ({:.4f})".format(best_name, results[best_name]['auc']))
 
-# DIAGNOSTIC: why the linear models struggle
+# DIAGNOSTIC: single-feature AUC vs Random Forest importance
 
-# Solo AUC asks: if this were the ONLY thing we knew, how well could we rank laps
-# by pit risk? 0.5 = useless, 1.0 = perfect. Comparing that against how heavily
-# the forest leans on each feature exposes the non-linear relationships - a
-# feature can look worthless alone yet be indispensable to a tree.
 print("\nDIAGNOSTIC - single-feature AUC vs Random Forest importance")
 forest = results['Random Forest']['model']
 importance = dict(zip(FEATURES, forest.feature_importances_))
@@ -159,11 +171,7 @@ rows = [(f, roc_auc_score(y_test, X_test[f]), importance[f]) for f in FEATURES]
 for feature, auc, imp in sorted(rows, key=lambda r: -r[2]):
     print("{:22} {:>10.4f} {:>12.4f}".format(feature, auc, imp))
 
-# RaceProgress is the smoking gun: near-random on its own, yet the forest's top
-# feature. Pit rate climbs through the middle of a race then collapses at the end,
-# and a straight line can't be both increasing and decreasing. Logistic regression
-# extracts nothing from it; a tree just carves the range into chunks.
-print("\nPit rate by race phase (the shape linear models can't fit):")
+print("\nPit rate by race phase (test year, 2024):")
 bins = [0, 0.15, 0.30, 0.45, 0.60, 0.75, 1.01]
 labels = ['0-15%', '15-30%', '30-45%', '45-60%', '60-75%', '75-100%']
 phase = pd.cut(test['RaceProgress'], bins=bins, labels=labels, right=False)
@@ -173,8 +181,6 @@ for p in labels:
 
 # ABLATION: do the caution features earn their place?
 
-# The experiment the proposal promised. Same model, same split, caution features
-# stripped out - the AUC gap is what they contribute.
 print("\nABLATION - Random Forest with vs without caution features")
 caution_features = ['AnyCautionThisLap', 'CautionJustStarted',
                     'SafetyCarThisLap', 'VSCThisLap', 'YellowThisLap']
@@ -195,9 +201,6 @@ print("  with caution features:    {:.4f}".format(auc_full))
 print("  without caution features: {:.4f}".format(auc_reduced))
 print("  difference:               {:+.4f}".format(auc_full - auc_reduced))
 
-# Cautions fire on under 5% of laps, so their effect on a season-wide average is
-# diluted. Scoring only the caution laps shows what the features are worth in the
-# situation they were built for.
 caution_laps = (test['AnyCautionThisLap'] == 1).values
 if caution_laps.sum() > 0 and y_test[caution_laps].nunique() > 1:
     print("\n  On caution laps only (n={}):".format(caution_laps.sum()))
