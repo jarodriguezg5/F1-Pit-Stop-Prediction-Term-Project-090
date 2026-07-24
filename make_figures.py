@@ -183,7 +183,7 @@ bars = ax.barh(cluster_summary['label'], cluster_summary['pit_rate'] * 100, colo
 overall_rate = df['PitNextLap'].mean() * 100
 ax.axvline(overall_rate, color='gray', linestyle='--', linewidth=1,
           label='Overall average ({:.1f}%)'.format(overall_rate))
-ax.set_xlim(0, cluster_summary['pit_rate'].max() * 100 * 1.15)
+ax.set_xlabel('Pit rate on the NEXT lap (%)')
 ax.set_title('K-Means found these groups with zero knowledge of pit stops —\nyet pit rate still varies 6x across them')
 for bar, rate in zip(bars, cluster_summary['pit_rate'] * 100):
     ax.text(rate + 0.3, bar.get_y() + bar.get_height()/2, '{:.1f}%'.format(rate), va='center', fontsize=10)
