@@ -1,8 +1,60 @@
 import pandas as pd
 import numpy as np
+from pathlib import Path
 
-# Pick up where the target-building left off
-df = pd.read_csv('f1_all_with_target.csv', low_memory=False)
+# Anchor every path to the project root, worked out from this file's own
+# location. That way the script runs the same whether you launch it from VS Code,
+# from the terminal, or from main.py - it never depends on which folder you
+# happened to be sitting in when you hit run.
+ROOT = Path(__file__).resolve().parent.parent
+RAW_DIR = ROOT / "Data" / "raw_data"
+FINAL_DIR = ROOT / "Data" / "final_data"
+FINAL_DIR.mkdir(parents=True, exist_ok=True)
+
+# Load the full multi-year raw dataset
+df = pd.read_csv(RAW_DIR / "f1_all_races.csv", low_memory=False)
+
+# PART 1: BUILD THE TARGET
+
+# flag every lap where the driver actually pitted
+# When a driver dives into the pit lane, FastF1 fills in "PitInTime" on that lap.
+# So "is PitInTime filled?" = "did they pit on this lap?" (1 = yes, 0 = no)
+df['PittedThisLap'] = df['PitInTime'].notna().astype(int)
+
+# put the laps in proper order
+# We sort by year -> race -> driver -> lap so that each driver's race
+# reads top-to-bottom in the right sequence. This matters a LOT for the next step.
+df = df.sort_values(['Year', 'RoundNumber', 'Driver', 'LapNumber']).reset_index(drop=True)
+
+# build the target -> "will this driver pit on the NEXT lap?"
+# shift(-1) means "grab the value from the row directly below." Within each
+# driver's race, that next row is their next lap. So if the next lap has
+# PittedThisLap = 1, then THIS lap gets PitNextLap = 1.
+# We group by year + race + driver so we never accidentally peek at a different
+# driver's lap or bleed from one race into another - and never bleed from one
+# YEAR into another, since round numbers repeat across seasons.
+df['PitNextLap'] = df.groupby(['Year', 'RoundNumber', 'Driver'])['PittedThisLap'].shift(-1)
+
+# handle the final lap of each race
+# The last lap a driver runs has no "next lap," so shift(-1) leaves it blank (NaN).
+# We can't label those, so we drop them.
+df = df.dropna(subset=['PitNextLap'])
+df['PitNextLap'] = df['PitNextLap'].astype(int)
+
+print(f"Total labeled laps: {len(df)}")
+print("\nTarget balance (0 = no pit next lap, 1 = pits next lap):")
+print(df['PitNextLap'].value_counts())
+print(f"\nPositive rate: {100 * df['PitNextLap'].mean():.2f}%")
+
+print("\nLaps and pit rate by year:")
+print(df.groupby('Year')['PitNextLap'].agg(laps='size', pit_rate='mean').to_string())
+
+# Verify against a known example: VER pitted on laps 17 and 37 in 2024 Bahrain
+print("\n--- VER 2024 Bahrain check (should see PitNextLap=1 on laps 16 and 36) ---")
+ver = df[(df['Driver'] == 'VER') & (df['Year'] == 2024) & (df['EventName'] == 'Bahrain Grand Prix')]
+print(ver[['LapNumber', 'Compound', 'TyreLife', 'PittedThisLap', 'PitNextLap']].head(38).to_string(index=False))
+
+# PART 2: ENGINEER THE FEATURES
 
 # LapTime comes as text like "0 days 00:01:37.284000". Can't do math on text,
 # so turn it into plain seconds (97.284).
@@ -10,7 +62,7 @@ df['LapTimeSeconds'] = pd.to_timedelta(df['LapTime']).dt.total_seconds()
 
 # FEATURE 1: Safety car / caution flags
 
-# These come first now, because tire degradation depends on knowing which laps
+# These come first, because tire degradation depends on knowing which laps
 # were run under caution.
 #
 # FastF1 crams every status code that happened during a lap into one string, so a
@@ -29,7 +81,7 @@ df['AnyCautionThisLap'] = ((df['SafetyCarThisLap'] == 1) | (df['VSCThisLap'] == 
 
 # Was there a caution on the PREVIOUS lap? shift(1) looks BACKWARD into the past,
 # which is always safe - that's information we genuinely had at the time. Grouping
-# by Year too, same reason as build_target.py: round numbers repeat across seasons.
+# by Year too, same reason as the target step: round numbers repeat across seasons.
 driver_race_groups = df.groupby(['Year', 'RoundNumber', 'Driver'])
 df['CautionPrevLap'] = driver_race_groups['AnyCautionThisLap'].shift(1).fillna(0).astype(int)
 
@@ -90,10 +142,10 @@ df['WetConditions'] = df['Compound'].isin(['INTERMEDIATE', 'WET']).astype(int)
 # FEATURE 4: Race progress and laps remaining
 
 # How long is this race? Take the highest lap number anyone reached, which is the
-# winner's count. The +1 is a correction: build_target.py dropped every driver's
+# winner's count. The +1 is a correction: the target step dropped every driver's
 # final lap, so what we can still see is one lap short of the real distance.
 #
-# Computed per YEAR + RACE, never per driver, and now that matters even more:
+# Computed per YEAR + RACE, never per driver, and that matters even more here:
 # with 7 seasons of retirements mixed in, using a driver's own max lap would
 # encode their retirement as "100% through the race" for a huge chunk of the data.
 df['RaceTotalLaps'] = df.groupby(['Year', 'RoundNumber'])['LapNumber'].transform('max') + 1
@@ -113,7 +165,7 @@ df['StopsSoFar'] = df.groupby(['Year', 'RoundNumber', 'Driver'])['PittedThisLap'
 
 # Sanity checks
 
-print("Tire degradation (green and caution should be similar magnitude):")
+print("\nTire degradation (green and caution should be similar magnitude):")
 print("  green flag laps:  {:.3f}s".format(df[df.AnyCautionThisLap == 0]['TireDegDelta'].mean()))
 print("  caution laps:     {:.3f}s".format(df[df.AnyCautionThisLap == 1]['TireDegDelta'].mean()))
 
@@ -151,5 +203,8 @@ for k in sorted(df['StopsSoFar'].unique()):
     subset = df[df.StopsSoFar == k]
     print("  {} stops   n={:6d}   {:5.2f}%".format(int(k), len(subset), 100 * subset['PitNextLap'].mean()))
 
-df.to_csv('f1_all_features.csv', index=False)
-print("\nSaved to f1_all_features.csv")
+# Save the final model-ready file. No intermediate CSV anymore - target and
+# features are built back-to-back in memory, so f1_all_with_target.csv is gone.
+out_path = FINAL_DIR / "f1_all_features.csv"
+df.to_csv(out_path, index=False)
+print("\nSaved to {}".format(out_path))
